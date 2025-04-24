@@ -10,64 +10,65 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: alpine:latest
+
     steps:
+      - name: Set up /github/workspace
+        run: mkdir -p /github/workspace
+
       - name: Install required Alpine packages
         run: |
           apk update
-          apk add build-base elfutils-dev openssl-dev bc flex bison perl linux-headers zstd-dev tar
+          apk add build-base abuild sudo git curl elfutils-dev openssl-dev bc flex bison perl linux-headers zstd-dev tar ncurses-dev bash
           adduser -D builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           chown -R builder /github/workspace
 
       - name: Set up abuild
         run: |
-          su builder -c 'abuild-keygen -a -n'  # 生成签名 key，不交互
-          echo "PACKAGER_PRIVKEY=/home/builder/.abuild/*.rsa" >> /etc/abuild.conf
+          su builder -c 'abuild-keygen -a -n'
+          echo 'PACKAGER_PRIVKEY="/home/builder/.abuild/$(ls /home/builder/.abuild/*.rsa | xargs -n1 basename)"' >> /etc/abuild.conf
 
-      - name: Prepare kernel source
+      - name: Prepare kernel source and APKBUILD
         run: |
-          mkdir -p /home/builder/packages
-          cd /home/builder
-          git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux-6.14
-          cp linux-6.14/Makefile .  # 确保目录结构OK
+          su builder -c '
+            cd /home/builder
+            git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux-6.14
+            mkdir -p linux-6.14/APKBUILD
+            curl -Lo linux-6.14/config https://raw.githubusercontent.com/huifujing/amd-kernel-6.14.0/main/config-6.1.0-32-amd64
 
-      - name: Setup APKBUILD and config
-        run: |
-          cd /home/builder
-          mkdir -p linux-6.14
-          curl -Lo config https://raw.githubusercontent.com/huifujing/amd-kernel-6.14.0/main/config-6.1.0-32-amd64
-          cat > APKBUILD <<'EOF'
-          # Contributor: You <your@email.com>
-          pkgname=linux-custom
-          pkgver=6.14.0
-          pkgrel=0
-          pkgdesc="Custom Linux Kernel"
-          url="https://kernel.org"
-          arch="x86_64"
-          license="GPL-2.0-only"
-          depends=""
-          makedepends="bash bc openssl-dev perl ncurses-dev libelf-dev elfutils-dev"
-          source="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$pkgver.tar.xz
-                  config"
+            cat > linux-6.14/APKBUILD <<EOF
+# Contributor: You <your@email.com>
+pkgname=linux-custom
+pkgver=6.14.0
+pkgrel=0
+pkgdesc="Custom Linux Kernel"
+url="https://kernel.org"
+arch="x86_64"
+license="GPL-2.0-only"
+depends=""
+makedepends="bash bc openssl-dev perl ncurses-dev elfutils-dev"
+source="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-\$pkgver.tar.xz
+        config"
 
-          build() {
-            cd "$srcdir/linux-$pkgver"
-            cp "$srcdir/config" .config
-            make olddefconfig
-            make -j$(nproc)
-          }
+build() {
+  cd "\$srcdir/linux-\$pkgver"
+  cp "\$srcdir/config" .config
+  make olddefconfig
+  make -j\$(nproc)
+}
 
-          package() {
-            cd "$srcdir/linux-$pkgver"
-            install -Dm644 arch/x86/boot/bzImage "$pkgdir"/boot/vmlinuz-$pkgver
-          }
+package() {
+  cd "\$srcdir/linux-\$pkgver"
+  install -Dm644 arch/x86/boot/bzImage "\$pkgdir"/boot/vmlinuz-\$pkgver
+}
 
-          sha512sums="SKIP"
-          EOF
+sha512sums="SKIP"
+EOF
+          '
 
       - name: Build kernel package (.apk)
         run: |
-          cd /home/builder
+          cd /home/builder/linux-6.14
           chown -R builder .
           su builder -c 'abuild -r'
 
