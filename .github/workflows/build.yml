@@ -12,31 +12,30 @@ jobs:
       image: alpine:latest
 
     steps:
-      - name: Set up /github/workspace
-        run: mkdir -p /github/workspace
-
       - name: Install required Alpine packages
         run: |
           apk update
-          apk add build-base abuild sudo git curl elfutils-dev openssl-dev bc flex bison perl linux-headers zstd-dev tar ncurses-dev bash
+          apk add --no-cache build-base elfutils-dev openssl-dev bc flex bison perl linux-headers zstd-dev tar git sudo abuild curl
+
+          # 创建 builder 用户
           adduser -D builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          chown -R builder /github/workspace
+          mkdir -p /home/builder/packages
+          chown -R builder /home/builder
 
       - name: Set up abuild
         run: |
-          su builder -c 'abuild-keygen -a -n'
-          echo 'PACKAGER_PRIVKEY="/home/builder/.abuild/$(ls /home/builder/.abuild/*.rsa | xargs -n1 basename)"' >> /etc/abuild.conf
+          su builder -c 'abuild-keygen -a -n'  # 生成 key
+          echo 'PACKAGER_PRIVKEY="/home/builder/.abuild/*.rsa"' >> /etc/abuild.conf
 
       - name: Prepare kernel source and APKBUILD
         run: |
           su builder -c '
             cd /home/builder
             git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux-6.14
-            mkdir -p linux-6.14/APKBUILD
             curl -Lo linux-6.14/config https://raw.githubusercontent.com/huifujing/amd-kernel-6.14.0/main/config-6.1.0-32-amd64
 
-            cat > linux-6.14/APKBUILD <<EOF
+            cat <<EOF > /home/builder/linux-6.14/APKBUILD
 # Contributor: You <your@email.com>
 pkgname=linux-custom
 pkgver=6.14.0
@@ -68,9 +67,10 @@ EOF
 
       - name: Build kernel package (.apk)
         run: |
-          cd /home/builder/linux-6.14
-          chown -R builder .
-          su builder -c 'abuild -r'
+          su builder -c '
+            cd /home/builder/linux-6.14
+            abuild -r
+          '
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -80,7 +80,6 @@ EOF
           retention-days: 7
 
       - name: Create Release
-        id: create_release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: linux-apk-${{ github.run_id }}
