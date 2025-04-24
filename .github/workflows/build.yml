@@ -1,116 +1,93 @@
-name: Build XanMod Kernel Debian Package
+name: Build Linux Kernel APK for Alpine
+
 on:
-  workflow_dispatch:  # 手动触发工作流
+  workflow_dispatch:
   push:
-    branches: [ main ]  # 在推送到 main 分支时自动运行
-  schedule:
-    - cron: '0 */8 * * *'  # 每8小时运行一次
-    
+    branches: [ main ]
+
 jobs:
-  build-kernel:
+  build-apk:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write  # 需要写入权限来创建Release
-    
+    container:
+      image: alpine:latest
     steps:
-      - name: Free up disk space
+      - name: Install required Alpine packages
         run: |
-          # 删除不必要的大型文件和目录
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          # 删除 Android SDK
-          sudo rm -rf /usr/local/lib/android
-          # 清理 apt 缓存
-          sudo apt-get clean
-          # 查看空间状况
-          df -h
+          apk update
+          apk add --no-cache alpine-sdk bash curl openssl-dev perl bc git ncurses-dev libelf-dev elfutils-dev
+          adduser -D builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          chown -R builder /github/workspace
 
-      - name: Install dependencies
+      - name: Set up abuild
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc lz4 rsync curl wget git fakeroot debhelper unzip
+          su builder -c 'abuild-keygen -a -n'  # 生成签名 key，不交互
+          echo "PACKAGER_PRIVKEY=/home/builder/.abuild/*.rsa" >> /etc/abuild.conf
 
-      - name: Download XanMod kernel source
+      - name: Prepare kernel source
         run: |
-          mkdir -p kernel-build
-          cd kernel-build
-          wget -O xanmod.zip https://gitlab.com/xanmod/linux/-/archive/6.14.2-xanmod1/linux-6.14.2-xanmod1.zip
-          if [ $? -ne 0 ]; then
-            echo "Failed to download XanMod kernel source"
-            exit 1
-          fi
-          unzip xanmod.zip
-          mv linux-6.14.2-xanmod1 ../linux-xanmod
+          mkdir -p /home/builder/packages
+          cd /home/builder
+          git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux-6.14
+          cp linux-6.14/Makefile .  # 确保目录结构OK
 
-      - name: Download kernel config file
+      - name: Setup APKBUILD and config
         run: |
-          cd kernel-build
-          wget -O .config https://raw.githubusercontent.com/huifujing/amd-kernel-6.14.0/main/config-6.1.0-32-amd64
-          if [ $? -ne 0 ]; then
-            echo "Failed to download config file"
-            exit 1
-          fi
-          cp .config ../linux-xanmod/
+          cd /home/builder
+          mkdir -p linux-6.14
+          curl -Lo config https://raw.githubusercontent.com/huifujing/amd-kernel-6.14.0/main/config-6.1.0-32-amd64
+          cat > APKBUILD <<'EOF'
+          # Contributor: You <your@email.com>
+          pkgname=linux-custom
+          pkgver=6.14.0
+          pkgrel=0
+          pkgdesc="Custom Linux Kernel"
+          url="https://kernel.org"
+          arch="x86_64"
+          license="GPL-2.0-only"
+          depends=""
+          makedepends="bash bc openssl-dev perl ncurses-dev libelf-dev elfutils-dev"
+          source="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$pkgver.tar.xz
+                  config"
 
-      - name: Prepare build environment
-        run: |
-          cd linux-xanmod
-          # 禁用调试信息以减少构建大小
-          sed -i 's/CONFIG_DEBUG_INFO=y/CONFIG_DEBUG_INFO=n/' .config
-          sed -i 's/CONFIG_DEBUG_INFO_DWARF4=y/CONFIG_DEBUG_INFO_DWARF4=n/' .config
-          sed -i 's/CONFIG_DEBUG_INFO_BTF=y/CONFIG_DEBUG_INFO_BTF=n/' .config
-          # 禁用一些不必要的模块
-          echo "CONFIG_DEBUG_INFO_REDUCED=y" >> .config
-          make olddefconfig
+          build() {
+            cd "$srcdir/linux-$pkgver"
+            cp "$srcdir/config" .config
+            make olddefconfig
+            make -j$(nproc)
+          }
 
-      - name: Build kernel packages without debug package
+          package() {
+            cd "$srcdir/linux-$pkgver"
+            install -Dm644 arch/x86/boot/bzImage "$pkgdir"/boot/vmlinuz-$pkgver
+          }
+
+          sha512sums="SKIP"
+          EOF
+
+      - name: Build kernel package (.apk)
         run: |
-          cd linux-xanmod
-          # 使用skipdbg参数避免生成调试包
-          make -j$(($(nproc) * 2)) bindeb-pkg LOCALVERSION=-xanmod1 KDEB_PKGVERSION=$(date +%Y%m%d)-1 skipdbg=true
-          
-      - name: Find and prepare Debian packages
-        id: find-debs
-        run: |
-          # 创建一个目录存放所有的deb文件
-          mkdir -p ./artifacts
-          # 复制所有的deb文件到artifacts目录
-          find . -name "*.deb" -type f -exec cp {} ./artifacts/ \;
-          echo "Found packages:"
-          ls -la ./artifacts/
-          # 创建版本号
-          echo "release_date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
-          # 创建包列表用于Release说明
-          find ./artifacts -name "*.deb" -type f | sort > ./artifacts/package-list.txt
-          
-      - name: Upload Build Artifacts
+          cd /home/builder
+          chown -R builder .
+          su builder -c 'abuild -r'
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xanmod-kernel-debs
-          path: ./artifacts/*.deb
+          name: kernel-apk
+          path: /home/builder/packages/**/linux-custom-*.apk
           retention-days: 7
-          
+
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: xanmod-kernel-${{ steps.find-debs.outputs.release_date }}
-          name: XanMod Kernel 6.14.2 Build ${{ steps.find-debs.outputs.release_date }}
+          tag_name: linux-apk-${{ github.run_id }}
+          name: Linux Kernel APK Build ${{ github.run_id }}
           draft: false
           prerelease: false
           generate_release_notes: true
           files: |
-            ./artifacts/*.deb
-          body: |
-            XanMod Kernel 6.14.2 build with AMD configuration
-            
-            Built on: ${{ steps.find-debs.outputs.release_date }}
-            
-            ## Packages:
-            ```
-            $(cat ./artifacts/package-list.txt)
-            ```
-            
-            This is an automated build triggered by GitHub Actions.
+            /home/builder/packages/**/linux-custom-*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
