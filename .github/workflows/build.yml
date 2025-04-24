@@ -15,16 +15,12 @@ jobs:
     steps:
       - name: Free up disk space
         run: |
-          # Remove unnecessary large files and directories
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          # Remove Android SDK
           sudo rm -rf /usr/local/lib/android
-          # Clean apt cache
           sudo apt-get clean
-          # Check available space
           df -h
 
       - name: Set up Docker
@@ -42,60 +38,10 @@ jobs:
             exit 1
           fi
 
-      - name: Build Alpine Linux kernel package with Docker
+      - name: Create build files
         run: |
-          # Create Dockerfile for Alpine Linux build environment
-          cat > Dockerfile << 'EOF'
-          FROM alpine:edge
-
-          # Install build dependencies
-          RUN apk add --no-cache \
-              alpine-sdk \
-              build-base \
-              abuild \
-              git \
-              curl \
-              wget \
-              ncurses-dev \
-              openssl-dev \
-              elfutils-dev \
-              bc \
-              lz4 \
-              rsync \
-              flex \
-              bison \
-              xz \
-              perl \
-              coreutils \
-              linux-headers \
-              findutils \
-              bash
-
-          # Create non-root build user for abuild
-          RUN adduser -D builder && \
-              addgroup builder abuild && \
-              mkdir -p /var/cache/distfiles && \
-              chmod a+w /var/cache/distfiles && \
-              echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-
-          # Setup keys for package signing
-          RUN mkdir -p /home/builder/.abuild && \
-              abuild-keygen -a -i -n -q
-
-          # Copy the abuild keys to system-wide location
-          RUN cp /home/builder/.abuild/*.pub /etc/apk/keys/
-
-          USER builder
-          WORKDIR /home/builder
-
           # Create APKBUILD file
-          RUN mkdir -p /home/builder/linux-custom
-          
-          COPY --chown=builder:builder config-6.14 /home/builder/linux-custom/config-custom
-          EOF
-
-          # Create APKBUILD file
-          cat > APKBUILD << 'EOF'
+          cat > kernel-build/APKBUILD << 'EOF'
           # Maintainer: Auto Build <auto@build.local>
           pkgname=linux-custom
           pkgver=6.14
@@ -123,13 +69,13 @@ jobs:
           options="!strip"
           source="
               https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$_pkgver.tar.xz
-              config-custom
+              config-6.14
               "
           builddir="$srcdir/linux-$_pkgver"
 
           prepare() {
               default_prepare
-              cp "$srcdir"/config-custom .config
+              cp "$srcdir"/config-6.14 .config
               # Disable debug info to reduce build size
               sed -i 's/CONFIG_DEBUG_INFO=y/CONFIG_DEBUG_INFO=n/' .config
               sed -i 's/CONFIG_DEBUG_INFO_DWARF4=y/CONFIG_DEBUG_INFO_DWARF4=n/' .config
@@ -156,27 +102,61 @@ jobs:
           }
           EOF
 
-          # Build kernel in Docker
-          docker run --rm -v $(pwd)/kernel-build:/home/builder/linux-custom -v $(pwd)/APKBUILD:/home/builder/linux-custom/APKBUILD -v $(pwd)/artifacts:/output alpine:edge /bin/sh -c "
-            apk add --no-cache alpine-sdk linux-headers git curl abuild
-            cd /home/builder/linux-custom
-            abuild-keygen -a -i -n
-            abuild checksum
-            abuild -r
-            cp /home/builder/packages/*/*.apk /output/
-          "
+          # Create Docker build script
+          cat > kernel-build/build.sh << 'EOF'
+          #!/bin/sh
+          set -e
 
-          echo "Built packages:"
-          ls -la ./artifacts/
+          # Setup Alpine build environment
+          apk update
+          apk add --no-cache alpine-sdk linux-headers git curl wget ncurses-dev openssl-dev elfutils-dev \
+            bc flex bison xz perl coreutils findutils bash lz4
+
+          # Create build directories
+          mkdir -p /home/packager/aports/custom
+          cp /src/APKBUILD /src/config-6.14 /home/packager/aports/custom/
+          cd /home/packager/aports/custom
+
+          # Setup abuild configuration
+          mkdir -p /home/packager/.abuild
+          cat > /home/packager/.abuild/abuild.conf << 'ABUILDCONF'
+          PACKAGER="Alpine Build <build@local>"
+          PACKAGER_PRIVKEY="/home/packager/.abuild/abuild.key"
+          MAINTAINER="$PACKAGER"
+          CLEANUP="srcdir"
+          ABUILDCONF
+
+          # Generate key for signing packages
+          abuild-keygen -n -a -i
+
+          # Build the package
+          abuild checksum
+          abuild -r
+
+          # Copy the built packages to output
+          find /home/packager/packages -name "*.apk" -type f -exec cp {} /output/ \;
+          EOF
+          
+          chmod +x kernel-build/build.sh
+
+      - name: Build Alpine Linux kernel package with Docker
+        run: |
+          docker run --rm -v $(pwd)/kernel-build:/src -v $(pwd)/artifacts:/output \
+            -u $(id -u):$(id -g) alpine:edge sh /src/build.sh
 
       - name: Find and prepare Alpine packages
         id: find-apks
         run: |
-          # Create version number
           echo "release_date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
-          # Create package list for Release notes
+          ls -la ./artifacts/
           find ./artifacts -name "*.apk" -type f | sort > ./artifacts/package-list.txt
-          cat ./artifacts/package-list.txt
+          if [ -s ./artifacts/package-list.txt ]; then
+            echo "Found packages:"
+            cat ./artifacts/package-list.txt
+          else
+            echo "No packages were built!"
+            exit 1
+          fi
           
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
