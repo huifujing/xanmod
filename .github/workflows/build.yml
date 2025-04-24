@@ -1,93 +1,209 @@
-name: Build Linux Kernel APK for Alpine
-
+name: Build Linux Kernel Alpine Package
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # Manual trigger
   push:
-    branches: [ main ]
+    branches: [ main ]  # Run automatically on push to main branch
+  schedule:
+    - cron: '0 */8 * * *'  # Run every 8 hours
 
 jobs:
-  build-apk:
+  build-kernel:
     runs-on: ubuntu-latest
-    container:
-      image: alpine:latest
-
+    permissions:
+      contents: write  # Need write permission to create Release
+    
     steps:
-      - name: Install required Alpine packages
+      - name: Free up disk space
         run: |
-          apk update
-          apk add --no-cache build-base elfutils-dev openssl-dev bc flex bison perl linux-headers zstd-dev tar git sudo abuild curl
+          # Remove unnecessary large files and directories
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          # Remove Android SDK
+          sudo rm -rf /usr/local/lib/android
+          # Clean apt cache
+          sudo apt-get clean
+          # Check available space
+          df -h
 
-          # 创建 builder 用户
-          adduser -D builder
-          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          mkdir -p /home/builder/packages
-          chown -R builder /home/builder
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
 
-      - name: Set up abuild
+      - name: Create work directory
+        run: mkdir -p kernel-build && mkdir -p artifacts
+
+      - name: Download kernel config file
         run: |
-          su builder -c 'abuild-keygen -a -n'  # 生成 key
-          echo 'PACKAGER_PRIVKEY="/home/builder/.abuild/*.rsa"' >> /etc/abuild.conf
+          cd kernel-build
+          wget -O config-6.14 https://raw.githubusercontent.com/huifujing/amd-kernel-6.14.0/main/config-6.1.0-32-amd64
+          if [ $? -ne 0 ]; then
+            echo "Failed to download config file"
+            exit 1
+          fi
 
-      - name: Prepare kernel source and APKBUILD
+      - name: Build Alpine Linux kernel package with Docker
         run: |
-          su builder -c '
-            cd /home/builder
-            git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git linux-6.14
-            curl -Lo linux-6.14/config https://raw.githubusercontent.com/huifujing/amd-kernel-6.14.0/main/config-6.1.0-32-amd64
+          # Create Dockerfile for Alpine Linux build environment
+          cat > Dockerfile << 'EOF'
+          FROM alpine:edge
 
-            cat <<EOF > /home/builder/linux-6.14/APKBUILD
-# Contributor: You <your@email.com>
-pkgname=linux-custom
-pkgver=6.14.0
-pkgrel=0
-pkgdesc="Custom Linux Kernel"
-url="https://kernel.org"
-arch="x86_64"
-license="GPL-2.0-only"
-depends=""
-makedepends="bash bc openssl-dev perl ncurses-dev elfutils-dev"
-source="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-\$pkgver.tar.xz
-        config"
+          # Install build dependencies
+          RUN apk add --no-cache \
+              alpine-sdk \
+              build-base \
+              abuild \
+              git \
+              curl \
+              wget \
+              ncurses-dev \
+              openssl-dev \
+              elfutils-dev \
+              bc \
+              lz4 \
+              rsync \
+              flex \
+              bison \
+              xz \
+              perl \
+              coreutils \
+              linux-headers \
+              findutils \
+              bash
 
-build() {
-  cd "\$srcdir/linux-\$pkgver"
-  cp "\$srcdir/config" .config
-  make olddefconfig
-  make -j\$(nproc)
-}
+          # Create non-root build user for abuild
+          RUN adduser -D builder && \
+              addgroup builder abuild && \
+              mkdir -p /var/cache/distfiles && \
+              chmod a+w /var/cache/distfiles && \
+              echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
-package() {
-  cd "\$srcdir/linux-\$pkgver"
-  install -Dm644 arch/x86/boot/bzImage "\$pkgdir"/boot/vmlinuz-\$pkgver
-}
+          # Setup keys for package signing
+          RUN mkdir -p /home/builder/.abuild && \
+              abuild-keygen -a -i -n -q
 
-sha512sums="SKIP"
-EOF
-          '
+          # Copy the abuild keys to system-wide location
+          RUN cp /home/builder/.abuild/*.pub /etc/apk/keys/
 
-      - name: Build kernel package (.apk)
-        run: |
-          su builder -c '
-            cd /home/builder/linux-6.14
+          USER builder
+          WORKDIR /home/builder
+
+          # Create APKBUILD file
+          RUN mkdir -p /home/builder/linux-custom
+          
+          COPY --chown=builder:builder config-6.14 /home/builder/linux-custom/config-custom
+          EOF
+
+          # Create APKBUILD file
+          cat > APKBUILD << 'EOF'
+          # Maintainer: Auto Build <auto@build.local>
+          pkgname=linux-custom
+          pkgver=6.14
+          _pkgver=6.14
+          pkgrel=0
+          pkgdesc="Linux kernel with custom configuration for AMD systems"
+          url="https://www.kernel.org"
+          arch="x86_64"
+          license="GPL-2.0-only"
+          makedepends="
+              bash
+              bc
+              bison
+              flex
+              gmp-dev
+              elfutils-dev
+              installkernel
+              linux-headers
+              mpc1-dev
+              mpfr-dev
+              openssl-dev
+              perl
+              xz
+              "
+          options="!strip"
+          source="
+              https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$_pkgver.tar.xz
+              config-custom
+              "
+          builddir="$srcdir/linux-$_pkgver"
+
+          prepare() {
+              default_prepare
+              cp "$srcdir"/config-custom .config
+              # Disable debug info to reduce build size
+              sed -i 's/CONFIG_DEBUG_INFO=y/CONFIG_DEBUG_INFO=n/' .config
+              sed -i 's/CONFIG_DEBUG_INFO_DWARF4=y/CONFIG_DEBUG_INFO_DWARF4=n/' .config
+              sed -i 's/CONFIG_DEBUG_INFO_BTF=y/CONFIG_DEBUG_INFO_BTF=n/' .config
+              echo "CONFIG_DEBUG_INFO_REDUCED=y" >> .config
+              make olddefconfig
+          }
+
+          build() {
+              make -j$(nproc) all
+          }
+
+          package() {
+              mkdir -p "$pkgdir"/boot "$pkgdir"/lib/modules
+              make INSTALL_MOD_PATH="$pkgdir" modules_install
+              make INSTALL_PATH="$pkgdir"/boot install
+              
+              # Create symlinks for easier booting
+              rm -f "$pkgdir"/lib/modules/$_pkgver/build "$pkgdir"/lib/modules/$_pkgver/source
+              rm -f "$pkgdir"/boot/System.map "$pkgdir"/boot/config "$pkgdir"/boot/vmlinuz
+              ln -sf "System.map-$_pkgver" "$pkgdir"/boot/System.map
+              ln -sf "config-$_pkgver" "$pkgdir"/boot/config
+              ln -sf "vmlinuz-$_pkgver" "$pkgdir"/boot/vmlinuz
+          }
+          EOF
+
+          # Build kernel in Docker
+          docker run --rm -v $(pwd)/kernel-build:/home/builder/linux-custom -v $(pwd)/APKBUILD:/home/builder/linux-custom/APKBUILD -v $(pwd)/artifacts:/output alpine:edge /bin/sh -c "
+            apk add --no-cache alpine-sdk linux-headers git curl abuild
+            cd /home/builder/linux-custom
+            abuild-keygen -a -i -n
+            abuild checksum
             abuild -r
-          '
+            cp /home/builder/packages/*/*.apk /output/
+          "
 
-      - name: Upload artifacts
+          echo "Built packages:"
+          ls -la ./artifacts/
+
+      - name: Find and prepare Alpine packages
+        id: find-apks
+        run: |
+          # Create version number
+          echo "release_date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+          # Create package list for Release notes
+          find ./artifacts -name "*.apk" -type f | sort > ./artifacts/package-list.txt
+          cat ./artifacts/package-list.txt
+          
+      - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-apk
-          path: /home/builder/packages/**/linux-custom-*.apk
+          name: kernel-apks
+          path: ./artifacts/*.apk
           retention-days: 7
-
+          
       - name: Create Release
+        id: create_release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: linux-apk-${{ github.run_id }}
-          name: Linux Kernel APK Build ${{ github.run_id }}
+          tag_name: kernel-${{ steps.find-apks.outputs.release_date }}
+          name: Linux Kernel 6.14 Alpine Build ${{ steps.find-apks.outputs.release_date }}
           draft: false
           prerelease: false
           generate_release_notes: true
           files: |
-            /home/builder/packages/**/linux-custom-*.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            ./artifacts/*.apk
+          body: |
+            Linux Kernel 6.14 build with AMD configuration for Alpine Linux
+            
+            Built on: ${{ steps.find-apks.outputs.release_date }}
+            
+            ## Packages:
+            ```
+            $(cat ./artifacts/package-list.txt)
+            ```
+            
+            This is an automated build triggered by GitHub Actions.
