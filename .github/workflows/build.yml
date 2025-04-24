@@ -23,11 +23,11 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Set up Docker
-        uses: docker/setup-buildx-action@v3
-
       - name: Create work directory
-        run: mkdir -p kernel-build && mkdir -p artifacts
+        run: |
+          mkdir -p kernel-build
+          mkdir -p artifacts
+          chmod 777 artifacts  # Ensure the output directory is writable
 
       - name: Download kernel config file
         run: |
@@ -106,16 +106,21 @@ jobs:
           cat > kernel-build/build.sh << 'EOF'
           #!/bin/sh
           set -e
-
+          
           # Setup Alpine build environment
           apk update
           apk add --no-cache alpine-sdk linux-headers git curl wget ncurses-dev openssl-dev elfutils-dev \
             bc flex bison xz perl coreutils findutils bash lz4
 
-          # Create build directories
+          # Create build user
+          adduser -D packager
+          addgroup packager abuild
+          echo "packager ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          
+          # Setup abuild directories and config
           mkdir -p /home/packager/aports/custom
           cp /src/APKBUILD /src/config-6.14 /home/packager/aports/custom/
-          cd /home/packager/aports/custom
+          chown -R packager:packager /home/packager
 
           # Setup abuild configuration
           mkdir -p /home/packager/.abuild
@@ -125,24 +130,28 @@ jobs:
           MAINTAINER="$PACKAGER"
           CLEANUP="srcdir"
           ABUILDCONF
+          chown -R packager:packager /home/packager/.abuild
 
-          # Generate key for signing packages
-          abuild-keygen -n -a -i
-
+          # Switch to packager user and build
+          cd /home/packager/aports/custom
+          su packager -c "abuild-keygen -n -a -i"
+          # Copy the key to system-wide location
+          cp /home/packager/.abuild/*.pub /etc/apk/keys/
+          
           # Build the package
-          abuild checksum
-          abuild -r
+          su packager -c "abuild checksum"
+          su packager -c "abuild -r"
 
-          # Copy the built packages to output
+          # Copy the built packages to output directory with correct permissions
           find /home/packager/packages -name "*.apk" -type f -exec cp {} /output/ \;
+          chown -R $(stat -c "%u:%g" /output) /output
           EOF
           
           chmod +x kernel-build/build.sh
 
       - name: Build Alpine Linux kernel package with Docker
         run: |
-          docker run --rm -v $(pwd)/kernel-build:/src -v $(pwd)/artifacts:/output \
-            -u $(id -u):$(id -g) alpine:edge sh /src/build.sh
+          docker run --rm -v $(pwd)/kernel-build:/src -v $(pwd)/artifacts:/output alpine:edge sh /src/build.sh
 
       - name: Find and prepare Alpine packages
         id: find-apks
