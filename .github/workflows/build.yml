@@ -37,7 +37,7 @@ jobs:
         run: |
           mkdir -p kernel-build
           cd kernel-build
-          wget -O .config https://raw.githubusercontent.com/huifujing/amd-kernel-6.14.0/main/config-6.1.0-32-amd64
+          wget -O .config https://github.com/huifujing/xanmod/blob/main/config-6.1.0-32-amd64
           if [ $? -ne 0 ]; then
             echo "Failed to download config file"
             exit 1
